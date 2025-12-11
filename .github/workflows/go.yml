@@ -1,4 +1,4 @@
-name: Go
+name: Go CI/CD Pipeline
 
 on:
   push:
@@ -6,44 +6,177 @@ on:
   pull_request:
     branches: [ '*' ]
 
+env:
+  GO_VERSION: '1.22'
+  HOST: localhost
+  PORT: 5432
+  USER: root
+  PASSWORD: root
+  DBNAME: root
+
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+        
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@v3
+      with:
+        version: latest
+        args: --timeout=5m
 
   test:
+    name: Test
+    needs: lint
     runs-on: ${{ matrix.os }}
-    env:
-      HOST: localhost
-      PORT: 5432
-      USER: root
-      PASSWORD: root
-      DBNAME: root
     strategy:
       matrix:
-        go_version: ['1.18', '1.17', '>=1.18']
-        os: ['ubuntu-latest', 'ubuntu-18.04']
+        go_version: ['1.20', '1.21', '1.22']
+        os: ['ubuntu-latest', 'ubuntu-22.04']
+      fail-fast: false
+    
     steps:
-    - uses: actions/checkout@v3
-
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
     - name: Set up Go
-      uses: actions/setup-go@v3
+      uses: actions/setup-go@v4
       with:
         go-version: ${{ matrix.go_version }}
+        cache: true
+        
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: ${{ runner.os }}-go-${{ matrix.go_version }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-${{ matrix.go_version }}-
+          
+    - name: Download dependencies
+      run: go mod download
       
-    - name: Build-DB
+    - name: Verify dependencies
+      run: go mod verify
+      
+    - name: Build Docker database
       run: docker-compose build
       
-    - name: Create-DB
+    - name: Start database
       run: docker-compose up -d
+      
+    - name: Wait for PostgreSQL
+      run: |
+        echo "Waiting for PostgreSQL to be ready..."
+        for i in {1..30}; do
+          if docker-compose exec -T db pg_isready -U $USER -d $DBNAME > /dev/null 2>&1; then
+            echo "PostgreSQL is ready!"
+            break
+          fi
+          echo "Attempt $i/30: PostgreSQL not ready yet..."
+          sleep 2
+        done
+        
+        # Verify connection one more time
+        docker-compose exec -T db pg_isready -U $USER -d $DBNAME
+        
+    - name: Run tests
+      run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+      env:
+        HOST: ${{ env.HOST }}
+        PORT: ${{ env.PORT }}
+        USER: ${{ env.USER }}
+        PASSWORD: ${{ env.PASSWORD }}
+        DBNAME: ${{ env.DBNAME }}
+        
+    - name: Upload coverage reports
+      if: matrix.go_version == '1.22' && matrix.os == 'ubuntu-latest'
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./coverage.out
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+        
+    - name: Cleanup
+      if: always()
+      run: |
+        docker-compose down -v
+        docker-compose rm -f
 
-    - name: Test
-      run: go test -v main_test.go   
-  
   build:
+    name: Build
     needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: ['ubuntu-latest', 'ubuntu-18.04']
+        os: ['ubuntu-latest', 'ubuntu-22.04']
+        go_version: ['1.22']
+      fail-fast: false
+      
     steps:
-    - uses: actions/checkout@v3
-    - name: Build
-      run: go build -v main.go
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ matrix.go_version }}
+        cache: true
+        
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: ${{ runner.os }}-go-${{ matrix.go_version }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-${{ matrix.go_version }}-
+          
+    - name: Download dependencies
+      run: go mod download
+      
+    - name: Build application
+      run: go build -v -ldflags="-w -s" -o app main.go
+      
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: app-${{ matrix.os }}
+        path: app
+        retention-days: 5
+
+  security:
+    name: Security Scan
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        
+    - name: Run Gosec Security Scanner
+      uses: securego/gosec@master
+      with:
+        args: '-no-fail -fmt sarif -out results.sarif ./...'
+        
+    - name: Upload SARIF file
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: results.sarif
